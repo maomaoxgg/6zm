@@ -1,0 +1,564 @@
+package utils
+
+import (
+	"errs"
+	"strconv"
+	"strings"
+	"fmt"
+	"regexp"
+	"reflect"
+	"bytes"
+	"github.com/astaxie/beego/validation"
+)
+
+/*---------------Read Me------------------
+Example:
+ExampleStruct struct {
+		OperateMode int    `json:"operate_mode" cpts:"range:15>=self>0 || self = 0 || self = 18;com:if EndTime > 111 then 0 <= self <= 5"`
+		Name        string `json:"name" valid:"Required" cpts:"lenChar:20;reg:^[a-z]+$;regDes:必须为小写字母"`
+	}
+一、结构体的tag为cpts，当前字段的值用self表示，cpts下的子tag以分号;分割，子tag与其后的表达式以冒号:分割
+二、以下为子tag
+1、通用tag
+	1）cnName(自定义中文名称):
+		与返回的错误信息中展示字段有关
+		example-----------        cnName：工程名称
+	2）cnName(从transport.go的翻译中查找对应key的中文名称):
+		与返回的错误信息中展示字段有关
+		example-----------        cnName：projectName
+	*TIP：msg返回中字段名称使用的优先级    1) > 2) > 结构体原生key
+2、字段类型tag
+	(1)、整形X位
+	1) range(范围判定):
+		支持>,>=,<,<=,!=,=,==
+		支持数学区间表示，如1<self<2,多区间用||区别
+		example-----------        range：15>=self>0 || 20 < self <30 || self = 18
+	2) com(复合判定):
+		格式为"if 条件表达式 then 判定表达式"
+		条件表达式：
+			暂时只支持一个其他字段
+			暂时支持整形字段的条件
+			不支持字段间的比较
+			必须为一个字段名（结构体Key与“json”tag下对应的解析key皆可）与一个值得比较，写法同1）
+		判定表达式：
+			同1)
+		example-----------        com:if EndTime > 111 then 0 <= self <= 5
+	(2)、字符串
+	1)	lenByte(字节长度):
+		后面为数字，数值为最大长度
+		example-----------        lenByte：30
+	2)	lenChar(字符长度)：
+		后面为数字，数值为最大长度
+		example-----------        lenChar:20
+	3)	reg（正则表达式判定字符串)：
+		后面为正则表达式，tag里的“\”必须加转义字符
+		example-----------        reg:^[a-z\\d\\._]{1-5}-[A-Z]*$
+	4)	regDes（正则表达式描述)：
+		后面为描述
+		example-----------        reg:中划线前必须为长度为1到5的小写字母、数字、点和下划线，中划线后可包含大写字母，也可为空
+	5)	contain(字符串包含判定)：
+		后面为可填的字符串，逗号,分割
+		example-----------        contain:我是谁,whoAmI,a_b_三
+	(3)、结构体
+
+	(4)、数组
+
+-------------------End--------------------
+*/
+
+type Symbol string
+
+type SymbolInfo struct {
+	opposite    string
+	description string
+}
+
+var symbolOpposite map[string]SymbolInfo
+
+const (
+	OurTag      = "our"
+	selfValue    = "self"
+	equal        = "="
+	great        = ">"
+	greatOrEqual = ">="
+	less         = "<"
+	lessOrEqual  = "<="
+	notEqual     = "!="
+	extend       = "when the compound query condition for this field is established"
+)
+
+func init() {
+	symbolOpposite = make(map[string]SymbolInfo, 6)
+	symbolOpposite[great] = SymbolInfo{opposite: less, description: "greater than"}
+	symbolOpposite[greatOrEqual] = SymbolInfo{opposite: lessOrEqual, description: "greater than or equal to"}
+	symbolOpposite[less] = SymbolInfo{opposite: great, description: "less than"}
+	symbolOpposite[lessOrEqual] = SymbolInfo{opposite: greatOrEqual, description: "less than or equal to"}
+	symbolOpposite[equal] = SymbolInfo{opposite: equal, description: "equal to"}
+	symbolOpposite[notEqual] = SymbolInfo{opposite: notEqual, description: "not equal to"}
+
+}
+
+type ColumnInfo struct {
+	name             string
+	objType          reflect.Type
+	objValue         reflect.Value
+	judge            string
+	condition        bool
+	regexDescription string
+	keyName          string
+}
+
+type ReckonInfo struct {
+	self  int
+	value int
+}
+
+func Validate(object interface{}) error {
+	errMsg := bytes.NewBufferString("")
+	validator := validation.Validation{}
+	b, err := validator.Valid(object)
+	if err != nil {
+		return errs.NewComplexError(400, errs.VALIDATOR_INTERNAL_ERROR, err.Error())
+	}
+	if !b {
+		validator.ErrorMap()
+		for key, val := range validator.ErrorMap() {
+			errMsg.WriteByte('"')
+			errMsg.WriteString(key)
+			errMsg.WriteByte('"')
+			errMsg.WriteByte(' ')
+			errMsg.WriteString(val.String())
+			errMsg.WriteByte(';')
+		}
+		return errs.NewComplexError(400, errs.VALIDATION_HAS_NOT_PASSED, errMsg.String())
+	}
+	return nil
+}
+
+func NewValidate(object interface{}) (err error) {
+	if err = Validate(object); err != nil {
+		return
+	}
+	_, err = CPTSValid(object)
+	return
+}
+
+func CPTSValid(obj interface{}) (b bool, err error) {
+	var msg, tag, value string
+	var VariableType uint
+	defer func() {
+		if msg != "" {
+			err = errs.NewComplexError(0, err.(errs.ErrorCode), msg[:len(msg)-1])
+		}
+	}()
+	objT := reflect.TypeOf(obj)
+	objV := reflect.ValueOf(obj)
+	switch uint(objT.Kind()) {
+	case 22:
+		objT = objT.Elem()
+		objV = objV.Elem()
+	case 25:
+	default:
+		msg = PrintfOther(1, "%v must be a struct or a struct pointer\n", obj)
+		err = errs.VALIDATOR_INTERNAL_ERROR
+		return
+	}
+	c := &ColumnInfo{objType: objT, objValue: objV, judge: ""}
+	for i := 0; i < objT.NumField(); i++ {
+		tag = objT.Field(i).Tag.Get(OurTag)
+		Println(i, tag)
+		if tag != "" {
+			value = fmt.Sprint(objV.Field(i).Interface())
+			VariableType = uint(objT.Field(i).Type.Kind())
+			c.name = ""
+			c.keyName = objT.Field(i).Name
+			c.regexDescription = ""
+			switch {
+			//intX
+			case 2 <= VariableType && VariableType <= 6:
+				err = c.validateInt(tag, value)
+				//string
+			case VariableType == 24:
+				err = c.validateString(tag, value)
+				//slice
+			case VariableType == 23:
+				//struct or ptr
+			case VariableType == 22 || VariableType == 25:
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+	return
+}
+
+/*
+Verify the int/int8/int16/int32/int64 type field
+Note:There may be some problems when the field type is int64.
+*/
+func (this *ColumnInfo) validateInt(tag, value string) (err error) {
+	var msg string
+	defer func() {
+		if msg != "" {
+			err = errs.NewComplexError(0, err.(errs.ErrorCode), msg[:len(msg)-1])
+		}
+	}()
+	var vInt int
+	if vInt, err = strconv.Atoi(value); err != nil {
+		msg = PrintfOther(1, "str parse int error.\n")
+		err = errs.STRING_PARSE_INT_ERROR
+		return
+	}
+	conditions := strings.Split(tag, ";")
+	for orderIndex := 0; orderIndex < 2; orderIndex++ {
+		for _, v := range conditions {
+			condition := strings.Split(v, ":")
+			if len(condition) == 2 {
+				if orderIndex == 0 {
+					switch condition[0] {
+					case "cnName":
+						this.name = condition[1]
+					case "cnNameTran":
+						if this.name == ""{
+							this.name = ProjectKey["ch"][condition[1]]
+						}
+					}
+					if this.name == ""{
+						this.name = this.keyName
+					}
+				} else {
+					switch condition[0] {
+					case "range":
+						if err = this.validateIntRange(condition[1], vInt, 2); err == nil {
+							this.judge = ""
+						}
+					case "com": //compound
+						err = this.validateIntCompound(condition[1], vInt)
+					}
+					if err != nil {
+						return
+					}
+				}
+			} else {
+				err = errs.VALIDATOR_INTERNAL_ERROR
+				return
+			}
+		}
+	}
+	return
+}
+
+/*
+Verify the string type field
+*/
+func (this *ColumnInfo) validateString(tag, value string) (err error) {
+	var msg string
+	defer func() {
+		if msg != "" {
+			err = errs.NewComplexError(0, err.(errs.ErrorCode), msg[:len(msg)-1])
+		}
+	}()
+	conditions := strings.Split(tag, ";")
+	for orderIndex := 0; orderIndex < 2; orderIndex++ {
+		for _, v := range conditions {
+			condition := strings.Split(v, ":")
+			if len(condition) == 2 {
+				if orderIndex == 0 {
+					switch condition[0] {
+					case "regDes":
+						this.regexDescription = condition[1]
+					case "cnName":
+						this.name = condition[1]
+					case "cnNameTran":
+						if this.name == ""{
+							this.name = ProjectKey["ch"][condition[1]]
+						}
+					}
+					if this.name == ""{
+						this.name = this.keyName
+					}
+				} else {
+					switch condition[0] {
+					case "lenByte":
+						if err = this.validateStringLen(condition[1], value, 1); err != nil {
+							return
+						}
+					case "lenChar":
+						if err = this.validateStringLen(condition[1], value, 2); err != nil {
+							return
+						}
+					case "contain":
+						if err = this.validateStringContain(condition[1], value); err != nil {
+							return
+						}
+					case "reg":
+						if err = this.validateStringRegex(condition[1], value); err != nil {
+							return
+						}
+					}
+					if err != nil {
+						return
+					}
+				}
+			} else {
+				err = errs.VALIDATOR_INTERNAL_ERROR
+				return
+			}
+		}
+	}
+
+	return
+}
+
+func (this *ColumnInfo) validateStringLen(ran, value string, mode int) (err error) {
+	var msg string
+	defer func() {
+		if msg != "" {
+			err = errs.NewComplexError(0, err.(errs.ErrorCode), msg[:len(msg)-1])
+		}
+	}()
+	var length int
+	if length, err = strconv.Atoi(ran); err != nil {
+		msg = PrintfOther(1, "str parse int error.\n")
+		err = errs.STRING_PARSE_INT_ERROR
+		return
+	}
+	valueDescription := fmt.Sprintf("%s(Value:%s) which is", this.name, value)
+	var objLength int
+	switch mode {
+	case 1:
+		objLength = len(value)
+		if objLength > length {
+			msg = PrintfOther(1, "The byte length of %s %d must be %s %d.\n", valueDescription, objLength, symbolOpposite[lessOrEqual].description, length)
+			err = errs.VALIDATION_HAS_NOT_PASSED
+		}
+	case 2:
+		objLength = strings.Count(value, "") - 1
+		if objLength > length {
+			msg = PrintfOther(1, "The character length of %s %d must be %s %d.\n", valueDescription, objLength, symbolOpposite[lessOrEqual].description, length)
+			err = errs.VALIDATION_HAS_NOT_PASSED
+		}
+	}
+	return
+}
+
+func (this *ColumnInfo) validateStringContain(ran, value string) (err error) {
+	var msg string
+	defer func() {
+		if msg != "" {
+			err = errs.NewComplexError(0, err.(errs.ErrorCode), msg[:len(msg)-1])
+		}
+	}()
+	stringArr := strings.Split(ran, ",")
+	valueDescription := fmt.Sprintf("The value of %s(%s) ", this.name, value)
+	var isMatch bool
+	for _, v := range stringArr {
+		if v == value {
+			isMatch = true
+			break
+		}
+	}
+	if !isMatch {
+		msg = PrintfOther(1, "%s must be one of %d options in %s.\n", valueDescription, len(stringArr), ran)
+		err = errs.VALIDATION_HAS_NOT_PASSED
+	}
+	return
+}
+
+func (this *ColumnInfo) validateStringRegex(ran, value string) (err error) {
+	var msg string
+	defer func() {
+		if msg != "" {
+			err = errs.NewComplexError(0, err.(errs.ErrorCode), msg[:len(msg)-1])
+		}
+	}()
+	reg := regexp.MustCompile(ran)
+	valueDescription := fmt.Sprintf("The value of %s(%s) ", this.name, value)
+	Println("reg.FindString(value)", reg.FindString(value))
+	Println("value", value)
+	if reg.FindString(value) != value {
+		msg = PrintfOther(1, "%s does`t match the rule.detail:%s.\n", valueDescription, this.regexDescription)
+		err = errs.VALIDATION_HAS_NOT_PASSED
+	}
+	return
+}
+
+/*
+This method is used as a judge condition(mode = 1) or a reckon(mode = 2)
+*/
+func (this *ColumnInfo) validateIntRange(ran string, self, mode int, extendDes ...string) (err error) {
+	var msg string
+	defer func() {
+		if msg != "" {
+			err = errs.NewComplexError(0, err.(errs.ErrorCode), msg[:len(msg)-1])
+		}
+	}()
+	orConditions := strings.Split(ran, "||")
+	local := []string{"$1$2", "$4$5"}
+	for _, orV := range orConditions {
+		orV = strings.Replace(orV, " ", "", -1)
+		orV = strings.Replace(orV, "==", "=", -1)
+		reg := regexp.MustCompile(`([\d]*)(<=?|!?=|>=?)?(` + selfValue + `)(<=?|!?=|>=?)?([\d]*)`)
+		var condition string
+		var conditions []string
+		for _, localV := range local {
+			if condition = reg.ReplaceAllString(orV, localV); condition != "" {
+				conditions = append(conditions, condition)
+			}
+		}
+		var andJudges []bool
+		for _, conditionsValue := range conditions {
+			var obj int
+			var symbol string
+			reg = regexp.MustCompile(`(\d*)((>=?)|(<=?)|(!?=))`)
+			if reg.FindString(conditionsValue) != conditionsValue {
+				if reg = regexp.MustCompile(`((>=?)|(<=?)|(!?=))(\d*)`); reg.FindString(conditionsValue) == conditionsValue {
+					if obj, err = strconv.Atoi(reg.ReplaceAllString(conditionsValue, "$5")); err != nil {
+						err = errs.STRING_PARSE_INT_ERROR
+						return
+					}
+					symbol = reg.ReplaceAllString(conditionsValue, "$1")
+					andJudges = append(andJudges, this.reckonRange(&ReckonInfo{self: 1, value: self}, &ReckonInfo{value: obj}, symbol, mode))
+				} else {
+					msg = PrintfOther(1, "Range(%s) reg is mismatched.\n", conditionsValue)
+					err = errs.VALIDATION_HAS_NOT_PASSED
+					return
+				}
+			} else {
+				if obj, err = strconv.Atoi(reg.ReplaceAllString(conditionsValue, "$1")); err != nil {
+					msg = PrintfOther(1, "Error:%v.\n", err)
+					err = errs.STRING_PARSE_INT_ERROR
+					return
+				}
+				symbol = reg.ReplaceAllString(conditionsValue, "$2")
+				andJudges = append(andJudges, this.reckonRange(&ReckonInfo{value: obj}, &ReckonInfo{self: 1, value: self}, symbol, mode))
+			}
+		}
+		var trueNum int
+		for judgeI, judgeV := range andJudges {
+			if judgeV {
+				trueNum++
+				if judgeI == len(andJudges)-1 && trueNum == len(andJudges) {
+					if mode == 1 {
+						this.condition = true
+					}
+					return
+				}
+			}
+		}
+	}
+	if this.judge != "" {
+		err = errs.VALIDATION_HAS_NOT_PASSED
+		if extendDes == nil {
+			msg = PrintfOther(1, "%v.\n", this.judge)
+		} else {
+			msg = PrintfOther(1, "%v,%s.\n", this.judge, extendDes[0])
+		}
+	}
+	return
+}
+
+/*
+The current version does not support comparisons between different type values.
+Must be one is one type in a struct,the other is a value of integer、string、bool and so on.
+*/
+func (this *ColumnInfo) validateIntCompound(ran string, self int) (err error) {
+	var msg string
+	defer func() {
+		if msg != "" {
+			err = errs.NewComplexError(0, err.(errs.ErrorCode), msg[:len(msg)-1])
+		}
+	}()
+	reg := regexp.MustCompile(`(if)([\S\s]*)(then)([\S\s]*)`)
+	condition := reg.ReplaceAllString(ran, "$2")
+	result := reg.ReplaceAllString(ran, "$4")
+	var selfName, selfJsonName, value string
+	var variableType uint
+	var isReckonOrNot bool
+AllConditions:
+	for _, v := range strings.Split(condition, "||") {
+		v = strings.Replace(v, " ", "", -1)
+		v = strings.Replace(v, "==", "=", -1)
+		if v == "" {
+			continue
+		}
+		for i := 0; i < this.objType.NumField(); i++ {
+			selfName = this.objType.Field(i).Name
+			selfJsonName = this.objType.Field(i).Tag.Get("json")
+			Println(selfName, selfJsonName)
+			if this.objType.Name() == selfName {
+				continue
+			}
+			reg = regexp.MustCompile(`([\d]*)(<=?|!?=|>=?)?(` + selfName + `|` + selfJsonName + `)(<=?|!?=|>=?)?([\d]*)`)
+
+			if reg.ReplaceAllString(v, "$3") == selfName || reg.ReplaceAllString(v, "$3") == selfJsonName {
+				v = reg.ReplaceAllString(v, "$1$2") + selfValue + reg.ReplaceAllString(v, "$4$5")
+				value = fmt.Sprint(this.objValue.Field(i).Interface())
+				variableType = uint(this.objType.Field(i).Type.Kind())
+				switch {
+				//intX
+				case 2 <= variableType && variableType <= 6:
+					var vInt int
+					if vInt, err = strconv.Atoi(value); err != nil {
+						msg = PrintfOther(1, "str parse int error.\n")
+						err = errs.STRING_PARSE_INT_ERROR
+						return
+					}
+					PrintfOther(2, "比较字符串:%v,比较的值%d.\n", v, vInt)
+					if err = this.validateIntRange(v, vInt, 1); err != nil {
+						return
+					} else {
+						if this.condition {
+							//fixme for add "||" and "&&" in future
+							isReckonOrNot = true
+							this.condition = false
+							break AllConditions
+						}
+					}
+					//string
+				case variableType == 24:
+					//bool
+				case variableType == 1:
+
+				}
+				break
+			}
+		}
+	}
+	//条件成立，进入计算
+	if isReckonOrNot {
+		if err = this.validateIntRange(result, self, 2, extend); err == nil {
+			this.judge = ""
+		}
+	}
+	return
+}
+
+func (this *ColumnInfo) reckonRange(left, right *ReckonInfo, symbol string, mode int) bool {
+	var self, obj int
+	if left.self == 0 {
+		self = right.value
+		symbol = symbolOpposite[symbol].opposite
+		obj = left.value
+	} else {
+		self = left.value
+		obj = right.value
+	}
+	valueDescription := fmt.Sprintf("The value of %s which is %d must be", this.name, self)
+	if mode == 2 {
+		if this.judge == "" {
+			this.judge = fmt.Sprintf("%s %s %d", valueDescription, symbolOpposite[symbol].description, obj)
+		} else {
+			this.judge = fmt.Sprintf("%s or %s %d", this.judge, symbolOpposite[symbol].description, obj)
+		}
+	}
+	if (symbol == equal && self != obj) || (symbol == notEqual && self == obj) || (symbol == great && self <= obj) ||
+		(symbol == greatOrEqual && self < obj) || (symbol == less && self >= obj) || (symbol == lessOrEqual && self > obj) {
+
+	} else {
+		return true
+	}
+	return false
+}
+
